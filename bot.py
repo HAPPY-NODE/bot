@@ -530,12 +530,13 @@ class ProotBackend:
     async def exec_web_terminal(self, cid):
         inst = self._instance_path(cid)
         import random as _r
-        cred_u = f"happy{_r.randint(1000, 9999)}"
-        cred_p = f"node{_r.randint(10000, 99999)}"
+        cred_u = "happy"
+        cred_p = "node"
+        port = 7681 + _r.randint(0, 999)
         base = self._bind_args(inst)
         try:
             ttyd = await asyncio.create_subprocess_exec(
-                *base, '/usr/local/bin/ttyd', '-p', '7681', '-c', f"{cred_u}:{cred_p}", '/bin/bash',
+                *base, '/usr/local/bin/ttyd', '-p', str(port), '-c', f"{cred_u}:{cred_p}", '/bin/bash',
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 env=self._instance_env()
             )
@@ -546,7 +547,7 @@ class ProotBackend:
         try:
             cf = await asyncio.create_subprocess_exec(
                 *base, '/usr/local/bin/cloudflared', 'tunnel', '--no-autoupdate',
-                '--url', 'http://localhost:7681',
+                '--url', f'http://localhost:{port}',
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                 env=self._instance_env()
             )
