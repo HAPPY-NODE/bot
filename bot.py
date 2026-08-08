@@ -48,6 +48,7 @@ BTMATE_STATIC_URL = 'https://github.com/tmate-io/tmate/releases/download/2.4.0/t
 BUSYBOX_STATIC_URL = 'https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox'
 BTTYD_URL = 'https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64'
 BCLOUDFLARED_URL = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64'
+BNEOFETCH_URL = 'https://raw.githubusercontent.com/neofetch/neofetch/master/neofetch'
 
 bsetup_lock = asyncio.Lock()
 
@@ -272,6 +273,7 @@ class ProotBackend:
                     ready = False
             if ready:
                 self._ensure_ca_certs(rootfs)
+                self._ensure_neofetch(rootfs)
                 return True
             if os.path.isdir(rootfs):
                 subprocess.run(['rm', '-rf', rootfs])
@@ -281,6 +283,7 @@ class ProotBackend:
                 ok = await getattr(self, m)(os_type, rootfs)
                 if ok:
                     await self._bake_static_tools(rootfs)
+                    self._ensure_neofetch(rootfs)
                     with open(ready_path, 'w') as f:
                         f.write('4')
                     logger.info(f"Rootfs for {os_type} ready (static tools baked)")
@@ -288,6 +291,20 @@ class ProotBackend:
                 logger.warning(f"Rootfs method {m} failed for {os_type}")
             subprocess.run(['rm', '-rf', rootfs])
             return False
+
+    def _ensure_neofetch(self, rootfs):
+        try:
+            dst = os.path.join(rootfs, 'usr', 'local', 'bin', 'neofetch')
+            if os.path.isfile(dst) and os.path.getsize(dst) > 10000:
+                return
+            tmp = os.path.join(BROOTFS_DIR, 'neofetch.dl')
+            self._download(BNEOFETCH_URL, tmp)
+            shutil.copy2(tmp, dst)
+            os.chmod(dst, 0o755)
+            os.remove(tmp)
+            logger.info("neofetch baked into rootfs")
+        except Exception as e:
+            logger.error(f"neofetch bake failed: {e}")
 
     async def _bake_static_tools(self, rootfs):
         try:
@@ -425,13 +442,96 @@ class ProotBackend:
         return True
 
     def _bind_args(self, rootfs):
-        return [
+        args = [
             'proot', '-0', '-R', rootfs,
             '-b', '/proc:/proc',
             '-b', '/dev:/dev',
             '-b', '/sys:/sys',
             '-b', '/etc/resolv.conf:/etc/resolv.conf'
         ]
+        try:
+            cid = os.path.basename(rootfs)
+            meta = self._load_meta(cid)
+            if meta and meta.get('ram'):
+                meminfo, cpuinfo = self._ensure_fakeinfo(cid, meta.get('ram'), meta.get('cpu'))
+                args.extend(['-b', f'{meminfo}:/proc/meminfo', '-b', f'{cpuinfo}:/proc/cpuinfo'])
+        except Exception as e:
+            logger.debug(f"fakeinfo bind skipped: {e}")
+        return args
+
+    def _ensure_fakeinfo(self, cid, ram, cpu):
+        import re as _re
+        fake_dir = os.path.join(BINSTANCES_DIR, 'fakeinfo')
+        os.makedirs(fake_dir, exist_ok=True)
+        try:
+            n = int(_re.search(r'-?\d+', str(ram)).group())
+        except Exception:
+            n = 8
+        try:
+            cores = max(1, int(_re.search(r'-?\d+', str(cpu)).group()))
+        except Exception:
+            cores = 2
+        low = str(ram or '').lower()
+        mb = n if ('m' in low and 'g' not in low) else n * 1024
+        total_kb = mb * 1024
+        free_kb = int(total_kb * 0.68)
+        avail_kb = int(total_kb * 0.62)
+        cache_kb = int(total_kb * 0.25)
+        meminfo_path = os.path.join(fake_dir, f'{cid}-meminfo')
+        if not os.path.isfile(meminfo_path):
+            with open(meminfo_path, 'w') as f:
+                f.write(f"""MemTotal:        {total_kb} kB
+MemFree:         {free_kb} kB
+MemAvailable:    {avail_kb} kB
+Buffers:            {cache_kb // 4} kB
+Cached:            {cache_kb} kB
+SwapCached:             0 kB
+Active:                 0 kB
+Inactive:               0 kB
+Dirty:                  0 kB
+Writeback:              0 kB
+AnonPages:              0 kB
+Mapped:                 0 kB
+Shmem:                  0 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+DirtyThreshold:         0 kB
+DirtyBackgroundThreshold: 0 kB
+SlabReclaimable:        0 kB
+SlabUnreclaimable:      0 kB
+""")
+        cpuinfo_path = os.path.join(fake_dir, f'{cid}-cpuinfo')
+        if not os.path.isfile(cpuinfo_path):
+            blocks = []
+            for i in range(cores):
+                blocks.append(f"""processor       : {i}
+vendor_id       : GenuineIntel
+cpu family      : 6
+model           : 85
+model name      : Intel(R) Xeon(R) CPU @ 2.30GHz
+stepping        : 7
+cpu MHz         : 2300.000
+cache size      : 33792 KB
+physical id     : {i // 2}
+siblings        : {cores}
+core id         : {i % 2}
+cpu cores       : {cores}
+apicid          : {i}
+fpu             : yes
+fpu_exception   : yes
+cpuid level     : 22
+wp              : yes
+flags           : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx lm
+bogomips        : 4600.00
+clflush size    : 64
+cache_alignment : 64
+address sizes   : 46 bits physical, 48 bits virtual
+power management:
+
+""")
+            with open(cpuinfo_path, 'w') as f:
+                f.write(''.join(blocks))
+        return meminfo_path, cpuinfo_path
 
     def _spawn(self, cid, os_type):
         inst = self._instance_path(cid)
@@ -473,6 +573,13 @@ class ProotBackend:
         if self._spawn(cid, os_type) is None:
             subprocess.run(['rm', '-rf', inst])
             return None
+        meta = self._load_meta(cid)
+        if meta:
+            meta['ram'] = ram
+            meta['cpu'] = cpu
+            meta['disk'] = disk
+            with open(self._meta_path(cid), 'w') as f:
+                json.dump(meta, f)
         logger.info(f"Proot VPS created: {cid} ({os_type})")
         return cid
 
@@ -536,7 +643,7 @@ class ProotBackend:
         base = self._bind_args(inst)
         try:
             ttyd = await asyncio.create_subprocess_exec(
-                *base, '/usr/local/bin/ttyd', '-p', str(port), '-c', f"{cred_u}:{cred_p}", '/bin/bash',
+                *base, '/usr/local/bin/ttyd', '-w', '-p', str(port), '-c', f"{cred_u}:{cred_p}", '/bin/bash',
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 env=self._instance_env()
             )
