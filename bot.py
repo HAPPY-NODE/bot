@@ -939,7 +939,9 @@ async def capture_ssh_session_line(process):
             output = await asyncio.wait_for(process.stdout.readline(), timeout=30.0)
             if not output:
                 break
-            line = output.decode('utf-8', errors='replace').strip()
+            line = clean_line(output.decode('utf-8', errors='replace'))
+            if not line:
+                continue
             collected.append(line)
             logger.debug(f"Tmate line: {line}")
             if "ssh session:" in line.lower():
@@ -960,6 +962,13 @@ async def docker_exec_sshx(container_id):
     return await backend.exec_sshx(container_id)
 
 
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def clean_line(line):
+    return ANSI_RE.sub('', line).strip()
+
+
 async def sshx_session(container_id):
     proc = await docker_exec_sshx(container_id)
     if not proc:
@@ -974,10 +983,15 @@ async def sshx_session(container_id):
                 break
             if not line_b:
                 break
-            line = line_b.decode(errors='replace').strip()
+            line = clean_line(line_b.decode(errors='replace'))
+            if not line:
+                continue
             collected.append(line)
             low = line.lower()
-            if 'http' in low or 'ssh:' in low or 'sshx.io' in low:
+            m = re.search(r'https?://\S+', low)
+            if m:
+                return m.group(0)
+            if 'ssh:' in low or 'sshx.io' in low:
                 return line
             if len(collected) > 15:
                 break
