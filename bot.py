@@ -1,5 +1,6 @@
 import random
 import logging
+import subprocess
 import sys
 import os
 import re
@@ -11,7 +12,535 @@ from discord import app_commands
 import sqlite3
 from dotenv import load_dotenv
 from datetime import datetime, timezone
-from vps_backend import get_backend
+
+# ============ VPS BACKEND (Docker + Proot auto-detect) ============
+import json
+import shutil
+import signal
+import tarfile
+import uuid
+
+logger = logging.getLogger('vps_backend')
+
+BBASE_DIR = '/var/lib/vps-bot'
+BINSTANCES_DIR = os.path.join(BBASE_DIR, 'instances')
+BROOTFS_DIR = os.path.join(BBASE_DIR, 'rootfs')
+
+BSUITES = {
+    'ubuntu': ('jammy', 'http://archive.ubuntu.com/ubuntu'),
+    'debian': ('bookworm', 'http://deb.debian.org/debian'),
+}
+
+BIMAGES = {
+    'ubuntu': 'ubuntu:22.04',
+    'debian': 'debian:bookworm',
+}
+
+bsetup_lock = asyncio.Lock()
+
+
+def _total_cpu():
+    return os.cpu_count() or 1
+
+
+def _total_mem_gb():
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    kb = float(line.split()[1])
+                    return kb / (1024 * 1024)
+    except Exception:
+        pass
+    return 8.0
+
+
+class DockerBackend:
+    name = 'docker'
+
+    def __init__(self):
+        self.host_cpus = _total_cpu()
+        self.host_mem_gb = _total_mem_gb()
+
+    async def _run(self, args, timeout=120):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return proc.returncode, out.decode(errors='replace'), err.decode(errors='replace')
+        except asyncio.TimeoutError:
+            return -1, '', 'timeout'
+        except Exception as e:
+            return -1, '', str(e)
+
+    async def run(self, image, hostname, ram, cpu, disk, container_name):
+        code, out, err = await self._run([
+            'docker', 'run', '-d',
+            '--privileged', '--cap-add=ALL',
+            '--restart', 'unless-stopped',
+            f'--memory={ram}',
+            f'--cpus={cpu}',
+            f'--hostname={hostname}',
+            f'--name={container_name}',
+            image,
+            'tail', '-f', '/dev/null'
+        ], timeout=120)
+        if code != 0:
+            logger.error(f"Docker run failed: {err}")
+            return None
+        return out.strip()
+
+    async def start(self, cid):
+        code, _, _ = await self._run(['docker', 'start', cid], timeout=60)
+        return code == 0
+
+    async def stop(self, cid):
+        code, _, _ = await self._run(['docker', 'stop', cid], timeout=60)
+        if code != 0:
+            await self._run(['docker', 'kill', cid], timeout=30)
+        return code == 0
+
+    async def restart(self, cid):
+        code, _, _ = await self._run(['docker', 'restart', cid], timeout=60)
+        return code == 0
+
+    async def rm(self, cid):
+        code, _, _ = await self._run(['docker', 'rm', '-f', cid], timeout=60)
+        return code == 0
+
+    async def install_tmate(self, cid, os_type):
+        _, _, err = await self._run([
+            'docker', 'exec', cid, 'bash', '-c',
+            'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tmate curl wget sudo openssh-client'
+        ], timeout=300)
+        if err:
+            logger.warning(f"Tmate install in {cid}: {err[-300:]}")
+
+    async def exec_tmate(self, cid):
+        try:
+            return await asyncio.create_subprocess_exec(
+                'docker', 'exec', cid, 'tmate', '-F',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+        except Exception as e:
+            logger.error(f"Tmate exec error for {cid}: {e}")
+            return None
+
+    def get_uptime(self, cid):
+        try:
+            out = subprocess.check_output(
+                ['docker', 'inspect', '-f', '{{.State.StartedAt}}', cid],
+                stderr=subprocess.STDOUT
+            ).decode().strip()
+            if not out or out == '<no value>':
+                return 'Not running'
+            start = datetime.fromisoformat(out.replace('Z', '+00:00'))
+            uptime = datetime.now(timezone.utc) - start
+            d = uptime.days
+            h, rem = divmod(uptime.seconds, 3600)
+            m, _ = divmod(rem, 60)
+            return f'{d}d {h}h {m}m'
+        except Exception:
+            return 'Unknown'
+
+    def get_stats(self, cid):
+        try:
+            out = subprocess.check_output([
+                'docker', 'stats', '--no-stream', '--format',
+                '{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}',
+                cid
+            ], stderr=subprocess.STDOUT).decode().strip()
+            parts = out.split('\t')
+            if len(parts) == 3:
+                return {'cpu': parts[0], 'mem': parts[1], 'net': parts[2]}
+        except Exception:
+            pass
+        return {'cpu': 'N/A', 'mem': 'N/A', 'net': 'N/A'}
+
+    def get_logs(self, cid, lines=50):
+        try:
+            out = subprocess.check_output(
+                ['docker', 'logs', '--tail', str(lines), cid],
+                stderr=subprocess.STDOUT
+            ).decode(errors='replace')
+            return out[-2000:]
+        except Exception:
+            return 'Failed to fetch logs'
+
+    def get_status(self, cid):
+        try:
+            out = subprocess.check_output(
+                ['docker', 'inspect', '-f', '{{.State.Status}}', cid],
+                stderr=subprocess.STDOUT
+            ).decode().strip()
+            if out == 'exited':
+                return 'stopped'
+            return out
+        except Exception:
+            return 'stopped'
+
+
+class ProotBackend:
+    name = 'proot'
+
+    def __init__(self):
+        self.host_cpus = _total_cpu()
+        self.host_mem_gb = _total_mem_gb()
+        self._tools_checked = False
+
+    async def _run(self, args, timeout=300):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return proc.returncode, out.decode(errors='replace'), err.decode(errors='replace')
+        except asyncio.TimeoutError:
+            return -1, '', 'timeout'
+        except Exception as e:
+            return -1, '', str(e)
+
+    def _ensure_tools(self):
+        if self._tools_checked:
+            return
+        missing = []
+        for tool in ('proot', 'debootstrap'):
+            if shutil.which(tool) is None:
+                missing.append(tool)
+        if missing:
+            up = subprocess.run(
+                ['apt-get', 'update', '-y'],
+                capture_output=True,
+                text=True
+            )
+            if up.returncode != 0:
+                logger.error(f"apt-get update failed: {up.stderr[-300:]}")
+            inst = subprocess.run(
+                ['apt-get', 'install', '-y'] + missing,
+                capture_output=True,
+                text=True
+            )
+            if inst.returncode != 0:
+                logger.error(f"apt-get install {missing} failed: {inst.stderr[-300:]}")
+        for tool in ('proot', 'debootstrap'):
+            if shutil.which(tool) is None:
+                logger.error(f"Required tool not available: {tool}")
+        self._tools_checked = True
+
+    def _rootfs_path(self, os_type):
+        return os.path.join(BROOTFS_DIR, os_type)
+
+    def _instance_path(self, cid):
+        return os.path.join(BINSTANCES_DIR, cid)
+
+    def _meta_path(self, cid):
+        return os.path.join(self._instance_path(cid), 'meta.json')
+
+    def _log_path(self, cid):
+        return os.path.join(self._instance_path(cid), 'vps.log')
+
+    async def _prepare_rootfs(self, os_type):
+        async with bsetup_lock:
+            self._ensure_tools()
+            rootfs = self._rootfs_path(os_type)
+            if os.path.isdir(rootfs) and os.path.isfile(os.path.join(rootfs, '.ready')):
+                return True
+            if os.path.isdir(rootfs):
+                subprocess.run(['rm', '-rf', rootfs])
+            os.makedirs(BROOTFS_DIR, exist_ok=True)
+            if await self._rootfs_from_docker(os_type, rootfs):
+                with open(os.path.join(rootfs, '.ready'), 'w') as f:
+                    f.write('ok')
+                logger.info(f"Rootfs for {os_type} created from Docker image")
+                return True
+            logger.warning(f"Docker image export failed for {os_type}, trying debootstrap")
+            if await self._rootfs_from_debootstrap(os_type, rootfs):
+                with open(os.path.join(rootfs, '.ready'), 'w') as f:
+                    f.write('ok')
+                return True
+            subprocess.run(['rm', '-rf', rootfs])
+            return False
+
+    async def _rootfs_from_docker(self, os_type, rootfs):
+        image = BIMAGES[os_type]
+        tmp_name = 'vps-rootfs-exporter'
+        try:
+            subprocess.run(['docker', 'rm', '-f', tmp_name], capture_output=True, timeout=30)
+        except Exception:
+            pass
+        try:
+            r = subprocess.run(
+                ['docker', 'create', '--name', tmp_name, image],
+                capture_output=True,
+                timeout=180
+            )
+            if r.returncode != 0:
+                logger.error(f"docker create for rootfs failed: {r.stderr.decode(errors='replace')[-300:]}")
+                return False
+            proc = subprocess.Popen(
+                ['docker', 'export', tmp_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            try:
+                with tarfile.open(fileobj=proc.stdout, mode='r|') as tar:
+                    tar.extractall(path=rootfs)
+            except Exception as e:
+                logger.error(f"rootfs extract error: {e}")
+            proc.wait(timeout=300)
+            subprocess.run(['docker', 'rm', '-f', tmp_name], capture_output=True, timeout=30)
+            if proc.returncode != 0:
+                logger.error("docker export failed")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"docker rootfs export error: {e}")
+            return False
+
+    async def _rootfs_from_debootstrap(self, os_type, rootfs):
+        try:
+            suite, mirror = BSUITES[os_type]
+        except KeyError:
+            return False
+        code, out, err = await self._run([
+            'debootstrap', '--variant=minimal', '--arch=amd64',
+            suite, rootfs, mirror
+        ], timeout=1800)
+        if code != 0:
+            logger.error(f"debootstrap {os_type} failed: {err[-500:]}")
+            return False
+        return True
+
+    def _bind_args(self, rootfs):
+        return [
+            'proot', '-0', '-R', rootfs,
+            '-b', '/proc:/proc',
+            '-b', '/dev:/dev',
+            '-b', '/sys:/sys',
+            '-b', '/etc/resolv.conf:/etc/resolv.conf'
+        ]
+
+    def _spawn(self, cid, os_type):
+        inst = self._instance_path(cid)
+        log_file = open(self._log_path(cid), 'ab')
+        try:
+            proc = subprocess.Popen(
+                self._bind_args(inst) + ['/bin/bash', '-c', 'exec tail -f /dev/null'],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                close_fds=True
+            )
+        except Exception as e:
+            logger.error(f"Spawn failed for {cid}: {e}")
+            return None
+        meta = {
+            'pid': proc.pid,
+            'os': os_type,
+            'started_at': datetime.now(timezone.utc).isoformat()
+        }
+        with open(self._meta_path(cid), 'w') as f:
+            json.dump(meta, f)
+        return meta
+
+    async def run(self, image, hostname, ram, cpu, disk, container_name):
+        os_type = image.split(':')[0]
+        if os_type not in BSUITES:
+            logger.error(f"Unsupported OS type: {os_type}")
+            return None
+        if not await self._prepare_rootfs(os_type):
+            logger.error(f"Rootfs creation failed for {os_type}")
+            return None
+        cid = uuid.uuid4().hex[:12]
+        inst = self._instance_path(cid)
+        os.makedirs(BINSTANCES_DIR, exist_ok=True)
+        code, out, err = await self._run(['cp', '-a', self._rootfs_path(os_type), inst], timeout=900)
+        if code != 0:
+            logger.error(f"Rootfs copy failed: {err}")
+            return None
+        if self._spawn(cid, os_type) is None:
+            subprocess.run(['rm', '-rf', inst])
+            return None
+        logger.info(f"Proot VPS created: {cid} ({os_type})")
+        return cid
+
+    async def start(self, cid):
+        meta = self._load_meta(cid)
+        if not os.path.isdir(self._instance_path(cid)):
+            return False
+        if meta and self._is_alive(meta.get('pid')):
+            return True
+        self._spawn(cid, (meta or {}).get('os', 'debian'))
+        return True
+
+    async def stop(self, cid):
+        meta = self._load_meta(cid)
+        if not meta:
+            return True
+        pid = meta.get('pid')
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        for _ in range(20):
+            if not self._is_alive(pid):
+                break
+            await asyncio.sleep(0.5)
+        return True
+
+    async def restart(self, cid):
+        await self.stop(cid)
+        await asyncio.sleep(1)
+        return await self.start(cid)
+
+    async def rm(self, cid):
+        await self.stop(cid)
+        meta = self._load_meta(cid)
+        if meta and meta.get('pid'):
+            try:
+                os.kill(meta['pid'], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await asyncio.sleep(1)
+        subprocess.run(['rm', '-rf', self._instance_path(cid)])
+        return True
+
+    async def install_tmate(self, cid, os_type):
+        inst = self._instance_path(cid)
+        code, out, err = await self._run(
+            self._bind_args(inst) + ['/bin/bash', '-c',
+             'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tmate curl wget sudo openssh-client'],
+            timeout=600
+        )
+        if code != 0:
+            logger.warning(f"Tmate install in {cid} failed: {err[-300:]}")
+        else:
+            logger.info(f"Tmate installed in {cid}")
+
+    async def exec_tmate(self, cid):
+        try:
+            return await asyncio.create_subprocess_exec(
+                *self._bind_args(self._instance_path(cid)),
+                '/bin/bash', '-c', 'tmate -F',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+        except Exception as e:
+            logger.error(f"Tmate exec error for {cid}: {e}")
+            return None
+
+    def _load_meta(self, cid):
+        try:
+            with open(self._meta_path(cid)) as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _is_alive(self, pid):
+        if not pid:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def get_uptime(self, cid):
+        meta = self._load_meta(cid)
+        if not meta or not self._is_alive(meta.get('pid')):
+            return 'Not running'
+        try:
+            start = datetime.fromisoformat(meta['started_at'])
+            uptime = datetime.now(timezone.utc) - start
+            h, rem = divmod(uptime.seconds, 3600)
+            m, _ = divmod(rem, 60)
+            return f"{uptime.days}d {h}h {m}m"
+        except Exception:
+            return 'Unknown'
+
+    def get_stats(self, cid):
+        return {'cpu': 'N/A', 'mem': 'N/A', 'net': 'N/A'}
+
+    def get_logs(self, cid, lines=50):
+        try:
+            with open(self._log_path(cid), 'rb') as f:
+                data = f.read()
+            return data.decode(errors='replace')[-2000:]
+        except Exception:
+            return 'Failed to fetch logs'
+
+    def get_status(self, cid):
+        meta = self._load_meta(cid)
+        if not meta:
+            return 'stopped'
+        return 'running' if self._is_alive(meta.get('pid')) else 'stopped'
+
+
+def _probe_docker():
+    try:
+        r = subprocess.run(['unshare', '--mount', 'true'], capture_output=True, timeout=10)
+        if r.returncode != 0:
+            return False
+    except Exception:
+        return False
+    if not _docker_alive():
+        _start_dockerd()
+    if not _docker_alive():
+        return False
+    try:
+        r = subprocess.run(
+            ['docker', 'run', '--rm', 'hello-world'],
+            capture_output=True,
+            timeout=60
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _docker_alive():
+    try:
+        r = subprocess.run(['docker', 'info'], capture_output=True, timeout=20)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _start_dockerd():
+    try:
+        log = open('/var/log/dockerd.log', 'ab')
+        subprocess.Popen(
+            ['dockerd'],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True
+        )
+        for _ in range(20):
+            time.sleep(1)
+            if _docker_alive():
+                return True
+    except Exception:
+        pass
+    return _docker_alive()
+
+
+def get_backend():
+    mode = os.environ.get('VPS_BACKEND', 'auto').lower()
+    if mode == 'docker':
+        return DockerBackend()
+    if mode == 'proot':
+        return ProotBackend()
+    if _probe_docker():
+        return DockerBackend()
+    return ProotBackend()
+
+# ============ END VPS BACKEND ============
 
 # Load environment variables
 load_dotenv()
@@ -239,7 +768,6 @@ async def async_docker_run(image, hostname, ram, cpu, disk, container_name):
         cid = await backend.run(image, hostname, ram, cpu, disk, container_name)
         if cid is None:
             logger.warning("Docker VPS creation failed - switching to Proot backend")
-            from vps_backend import ProotBackend
             backend = ProotBackend()
             return await backend.run(image, hostname, ram, cpu, disk, container_name)
         return cid
