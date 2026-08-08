@@ -564,7 +564,7 @@ class ProotBackend:
         try:
             return await asyncio.create_subprocess_exec(
                 *self._bind_args(self._instance_path(cid)),
-                '/usr/local/bin/sshx', 'run',
+                '/usr/local/bin/sshx',
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env={**os.environ, 'TERM': 'xterm', 'HOME': '/root'}
