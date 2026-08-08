@@ -46,6 +46,8 @@ BUBUNTU_BASE_URLS = [
 
 BTMATE_STATIC_URL = 'https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz'
 BUSYBOX_STATIC_URL = 'https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox'
+BTTYD_URL = 'https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64'
+BCLOUDFLARED_URL = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64'
 
 bsetup_lock = asyncio.Lock()
 
@@ -265,7 +267,7 @@ class ProotBackend:
             if os.path.isfile(ready_path):
                 try:
                     with open(ready_path) as f:
-                        ready = f.read().strip() == '2'
+                        ready = f.read().strip() == '3'
                 except Exception:
                     ready = False
             if ready:
@@ -279,8 +281,8 @@ class ProotBackend:
                 if ok:
                     await self._bake_static_tools(rootfs)
                     with open(ready_path, 'w') as f:
-                        f.write('2')
-                    logger.info(f"Rootfs for {os_type} ready (tmate preinstalled)")
+                        f.write('3')
+                    logger.info(f"Rootfs for {os_type} ready (static tools baked)")
                     return True
                 logger.warning(f"Rootfs method {m} failed for {os_type}")
             subprocess.run(['rm', '-rf', rootfs])
@@ -365,6 +367,22 @@ class ProotBackend:
                     os.remove(inst_script)
         except Exception as e:
             logger.error(f"sshx bake failed: {e}")
+        try:
+            ttmp = os.path.join(BROOTFS_DIR, 'ttyd.static')
+            await asyncio.to_thread(self._download, BTTYD_URL, ttmp)
+            shutil.copy2(ttmp, os.path.join(rootfs, 'usr', 'local', 'bin', 'ttyd'))
+            os.chmod(os.path.join(rootfs, 'usr', 'local', 'bin', 'ttyd'), 0o755)
+            os.remove(ttmp)
+        except Exception as e:
+            logger.error(f"ttyd bake failed: {e}")
+        try:
+            ctmp = os.path.join(BROOTFS_DIR, 'cloudflared.static')
+            await asyncio.to_thread(self._download, BCLOUDFLARED_URL, ctmp)
+            shutil.copy2(ctmp, os.path.join(rootfs, 'usr', 'local', 'bin', 'cloudflared'))
+            os.chmod(os.path.join(rootfs, 'usr', 'local', 'bin', 'cloudflared'), 0o755)
+            os.remove(ctmp)
+        except Exception as e:
+            logger.error(f"cloudflared bake failed: {e}")
 
     @staticmethod
     def _extract_tar_xz(src, dst):
@@ -576,6 +594,71 @@ class ProotBackend:
             )
         except Exception as e:
             logger.error(f"Sshx exec error for {cid}: {e}")
+            return None
+
+    def _instance_env(self):
+        return {**os.environ, 'TERM': 'xterm', 'HOME': '/root'}
+
+    def _proot_base(self, cid):
+        return self._bind_args(self._instance_path(cid))
+
+    async def exec_web_terminal(self, cid):
+        inst = self._instance_path(cid)
+        import random as _r
+        cred = f"happy{_r.randint(1000, 9999)}:node{_r.randint(10000, 99999)}"
+        proc_extra = {'stdout': asyncio.subprocess.PIPE, 'stderr': asyncio.subprocess.STDOUT, 'env': self._instance_env()}
+        base = self._bind_args(inst)
+        try:
+            ttyd = await asyncio.create_subprocess_exec(
+                *base, '/usr/local/bin/ttyd', '-p', '7681', '-c', cred, '/bin/bash',
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                env=self._instance_env()
+            )
+        except Exception as e:
+            logger.error(f"ttyd start failed: {e}")
+            return None
+        await asyncio.sleep(2)
+        try:
+            cf = await asyncio.create_subprocess_exec(
+                *base, '/usr/local/bin/cloudflared', 'tunnel', '--no-autoupdate',
+                '--url', 'http://localhost:7681', **proc_extra
+            )
+        except Exception as e:
+            logger.error(f"cloudflared start failed: {e}")
+            try:
+                ttyd.kill()
+                await ttyd.wait()
+            except Exception:
+                pass
+            return None
+        try:
+            for _ in range(40):
+                try:
+                    line_b = await asyncio.wait_for(cf.stdout.readline(), timeout=3)
+                except asyncio.TimeoutError:
+                    continue
+                if not line_b:
+                    raise RuntimeError('cloudflared exited early')
+                line = ANSI_RE.sub('', line_b.decode(errors='replace')).strip()
+                logger.info(f"cloudflared: {line[:160]}")
+                if 'trycloudflare.com' in line:
+                    m = re.search(r'https?://\S*trycloudflare\.com', line)
+                    if m:
+                        return f"{m.group(0)} | login: {cred}"
+            raise RuntimeError('cloudflared produced no tunnel URL')
+        except Exception as e:
+            logger.error(f"Web terminal failed: {e}")
+            for p in (cf, ttyd):
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            await asyncio.sleep(1)
+            for p in (cf, ttyd):
+                try:
+                    p.kill()
+                except Exception:
+                    pass
             return None
 
     def _load_meta(self, cid):
@@ -1009,6 +1092,19 @@ async def sshx_session(container_id):
     return None
 
 
+async def proot_web_terminal_session(container_id):
+    be = globals().get('backend')
+    fn = getattr(be, 'exec_web_terminal', None)
+    if not fn:
+        logger.warning("web terminal not supported by current backend, skipping")
+        return None
+    try:
+        return await fn(container_id)
+    except Exception as e:
+        logger.error(f"web terminal session error: {e}")
+        return None
+
+
 async def get_ssh_line(container_id):
     exec_process = await docker_exec_tmate(container_id)
     if exec_process:
@@ -1027,6 +1123,11 @@ async def get_ssh_line(container_id):
     if sshx_line:
         logger.info("SSH session obtained via sshx")
         return sshx_line
+    logger.warning("sshx failed, falling back to ttyd web terminal")
+    web_line = await proot_web_terminal_session(container_id)
+    if web_line:
+        logger.info("SSH session obtained via cloud web terminal")
+        return web_line
     return None
 
 # Generic regen SSH
