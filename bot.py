@@ -462,10 +462,10 @@ class ProotBackend:
         cmd = (
             "rm -f /etc/apt/sources.list.d/ubuntu.sources; "
             "printf 'deb http://archive.ubuntu.com/ubuntu jammy main universe restricted multiverse\\ndeb http://security.ubuntu.com/ubuntu jammy-security main universe restricted multiverse\\n' > /etc/apt/sources.list; "
-            "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true || true; "
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ubuntu-keyring || true; "
-            "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true || true; "
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true tmate curl wget sudo openssh-client ca-certificates"
+            "apt-get update --allow-unauthenticated || true; "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-unauthenticated ubuntu-keyring || true; "
+            "apt-get update --allow-unauthenticated || true; "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated tmate curl wget sudo openssh-client ca-certificates"
         )
         code, out, err = await self._run(
             self._bind_args(inst) + ['/bin/bash', '-c', cmd],
@@ -1037,8 +1037,18 @@ async def create_vps(interaction: discord.Interaction, os_type, ram=DEFAULT_RAM,
         embed = discord.Embed(description="Resource validation failed. Please contact an admin.", color=discord.Color.red())
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send("Creating your VPS instance...", ephemeral=True)
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.NotFound:
+        logger.warning("Interaction expired for deploy command")
+        return
+    except Exception as e:
+        logger.error(f"Defer failed: {e}")
+        return
+    try:
+        await interaction.followup.send("Creating your VPS instance...", ephemeral=True)
+    except discord.NotFound:
+        logger.warning("Followup expired, continuing create")
     hostname = f"{VPS_HOSTNAME}-{user_id}"
     suffix = random.randint(1000, 9999)
     container_name = f"{os_type}-vps-{user_id}-{suffix}"
