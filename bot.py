@@ -640,43 +640,77 @@ power management:
         import random as _r
         cred_u = "happy"
         cred_p = "node"
-        port = 7681 + _r.randint(0, 999)
         base = self._bind_args(inst)
-        sleep_before = 1.2
-        for attempt in range(3):
+        host_tools = os.path.join(BBASE_DIR, 'hostbin')
+        os.makedirs(host_tools, exist_ok=True)
+        host_ttyd = os.path.join(host_tools, 'ttyd')
+        try:
+            rootfs = self._rootfs_path('ubuntu')
+            if os.path.isdir(rootfs):
+                rbin = os.path.join(rootfs, 'usr', 'local', 'bin', 'ttyd')
+                if os.path.isfile(rbin) and not os.path.isfile(host_ttyd):
+                    shutil.copy2(rbin, host_ttyd)
+                    os.chmod(host_ttyd, 0o755)
+        except Exception as e:
+            logger.error(f"host ttyd copy failed: {e}")
+        for attempt in range(4):
             port = 7681 + _r.randint(0, 999)
             ttyd = None
             cf = None
             ttyd_lines = []
+            rb = os.path.join(self._instance_path(cid), 'usr', 'local', 'bin', 'ttyd')
+            cmd = None
+            if os.path.isfile(rb):
+                cmd = [*base, rb, '-w', '-i', '0.0.0.0', '-p', str(port), '-c', f"{cred_u}:{cred_p}", '/bin/bash']
+            elif os.path.isfile(host_ttyd):
+                cmd = [host_ttyd, '-w', '-i', '0.0.0.0', '-p', str(port), '-c', f"{cred_u}:{cred_p}", *base, '/bin/bash']
+            if not cmd:
+                logger.error("ttyd binary not found in rootfs or host")
+                return None
             try:
                 ttyd = await asyncio.create_subprocess_exec(
-                    *base, '/usr/local/bin/ttyd', '-w', '-p', str(port), '-c', f"{cred_u}:{cred_p}", '/bin/bash',
+                    *cmd,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                     env=self._instance_env()
                 )
             except Exception as e:
                 logger.error(f"ttyd start failed: {e}")
                 return None
-            await asyncio.sleep(sleep_before)
-            alive = ttyd.returncode is None
-            if alive:
+
+            async def _drain_ttyd():
                 try:
-                    s = socket.create_connection(('127.0.0.1', port), timeout=2)
+                    while True:
+                        line_b = await ttyd.stdout.readline()
+                        if not line_b:
+                            break
+                        if len(ttyd_lines) < 50:
+                            ttyd_lines.append(line_b.decode(errors='replace').strip()[:220])
+                except Exception:
+                    pass
+            _drain_task = asyncio.create_task(_drain_ttyd())
+
+            alive = False
+            for probe_i in range(5):
+                if ttyd.returncode is not None:
+                    break
+                try:
+                    s = socket.create_connection(('127.0.0.1', port), timeout=1.5)
                     s.close()
                     alive = True
+                    break
                 except Exception:
-                    alive = False
+                    await asyncio.sleep(1.0)
             if not alive:
                 try:
-                    line_b = await asyncio.wait_for(ttyd.stdout.readline(), timeout=1)
-                    ttyd_lines.append(line_b.decode(errors='replace').strip()[:200])
+                    _drain_task.cancel()
                 except Exception:
                     pass
                 try:
                     ttyd.kill()
+                    await asyncio.wait_for(ttyd.wait(), timeout=3)
                 except Exception:
                     pass
-                logger.error(f"ttyd not listening on {port}. Lines: {' | '.join(ttyd_lines[:6])}")
+                logger.error(f"ttyd NOT listening on {port}. Output: {' | '.join(ttyd_lines[:10])}")
                 continue
             logger.info(f"ttyd up on port {port}")
             try:
@@ -724,7 +758,7 @@ power management:
                         p.kill()
                     except Exception:
                         pass
-        logger.error("Web terminal failed after 3 attempts")
+        logger.error("Web terminal failed after 4 attempts")
         return None
 
     def _load_meta(self, cid):
