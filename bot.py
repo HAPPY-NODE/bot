@@ -44,6 +44,9 @@ BUBUNTU_BASE_URLS = [
     'http://cdimage.ubuntu.com/ubuntu-base/releases/jammy/release/ubuntu-base-22.04.1-base-amd64.tar.gz',
 ]
 
+BTMATE_STATIC_URL = 'https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz'
+BUSYBOX_STATIC_URL = 'https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox'
+
 bsetup_lock = asyncio.Lock()
 
 
@@ -132,7 +135,7 @@ class DockerBackend:
             return await asyncio.create_subprocess_exec(
                 'docker', 'exec', cid, 'tmate', '-F',
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.STDOUT
             )
         except Exception as e:
             logger.error(f"Tmate exec error for {cid}: {e}")
@@ -257,27 +260,75 @@ class ProotBackend:
         async with bsetup_lock:
             self._ensure_tools()
             rootfs = self._rootfs_path(os_type)
-            if os.path.isdir(rootfs) and os.path.isfile(os.path.join(rootfs, '.ready')):
+            ready = False
+            ready_path = os.path.join(rootfs, '.ready')
+            if os.path.isfile(ready_path):
+                try:
+                    with open(ready_path) as f:
+                        ready = f.read().strip() == '1'
+                except Exception:
+                    ready = False
+            if ready:
                 return True
             if os.path.isdir(rootfs):
                 subprocess.run(['rm', '-rf', rootfs])
             os.makedirs(BROOTFS_DIR, exist_ok=True)
-            if await self._rootfs_from_tarball(os_type, rootfs):
-                with open(os.path.join(rootfs, '.ready'), 'w') as f:
-                    f.write('ok')
-                return True
-            if await self._rootfs_from_docker(os_type, rootfs):
-                with open(os.path.join(rootfs, '.ready'), 'w') as f:
-                    f.write('ok')
-                logger.info(f"Rootfs for {os_type} created from Docker image")
-                return True
-            logger.warning(f"Docker image export failed for {os_type}, trying debootstrap")
-            if await self._rootfs_from_debootstrap(os_type, rootfs):
-                with open(os.path.join(rootfs, '.ready'), 'w') as f:
-                    f.write('ok')
-                return True
+            makers = ('_rootfs_from_tarball', '_rootfs_from_docker', '_rootfs_from_debootstrap')
+            for m in makers:
+                ok = await getattr(self, m)(os_type, rootfs)
+                if ok:
+                    await self._bake_static_tools(rootfs)
+                    with open(ready_path, 'w') as f:
+                        f.write('1')
+                    logger.info(f"Rootfs for {os_type} ready (tmate preinstalled)")
+                    return True
+                logger.warning(f"Rootfs method {m} failed for {os_type}")
             subprocess.run(['rm', '-rf', rootfs])
             return False
+
+    async def _bake_static_tools(self, rootfs):
+        os.makedirs(os.path.join(rootfs, 'usr', 'bin'), exist_ok=True)
+        os.makedirs(os.path.join(rootfs, 'usr', 'local', 'bin'), exist_ok=True)
+        try:
+            tmp = os.path.join(BROOTFS_DIR, 'tmate-static.tar.xz')
+            work = os.path.join(BROOTFS_DIR, 'tmate-static-work')
+            if os.path.exists(work):
+                shutil.rmtree(work, ignore_errors=True)
+            await asyncio.to_thread(self._download, BTMATE_STATIC_URL, tmp)
+            await asyncio.to_thread(self._extract_tar_xz, tmp, work)
+            found = None
+            for root, dirs, files in os.walk(work):
+                for fn in files:
+                    if fn == 'tmate':
+                        found = os.path.join(root, fn)
+                        break
+                if found:
+                    break
+            if found:
+                shutil.copy2(found, os.path.join(rootfs, 'usr', 'bin', 'tmate'))
+                os.chmod(os.path.join(rootfs, 'usr', 'bin', 'tmate'), 0o755)
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            shutil.rmtree(work, ignore_errors=True)
+        except Exception as e:
+            logger.error(f"Tmate static bake failed: {e}")
+        try:
+            btmp = os.path.join(BROOTFS_DIR, 'busybox.static')
+            await asyncio.to_thread(self._download, BUSYBOX_STATIC_URL, btmp)
+            shutil.copy2(btmp, os.path.join(rootfs, 'usr', 'local', 'bin', 'busybox'))
+            os.chmod(os.path.join(rootfs, 'usr', 'local', 'bin', 'busybox'), 0o755)
+            for link in ('wget', 'ping', 'nc', 'tar', 'awk', 'sed', 'top', 'uname'):
+                ln = os.path.join(rootfs, 'usr', 'local', 'bin', link)
+                if not os.path.exists(ln):
+                    os.symlink('busybox', ln)
+            os.remove(btmp)
+        except Exception as e:
+            logger.error(f"Busybox static bake failed: {e}")
+
+    @staticmethod
+    def _extract_tar_xz(src, dst):
+        with tarfile.open(src, 'r:xz') as tar:
+            tar.extractall(path=dst)
 
     async def _rootfs_from_tarball(self, os_type, rootfs):
         try:
@@ -458,31 +509,16 @@ class ProotBackend:
         return True
 
     async def install_tmate(self, cid, os_type):
-        inst = self._instance_path(cid)
-        cmd = (
-            "rm -f /etc/apt/sources.list.d/ubuntu.sources; "
-            "printf 'deb http://archive.ubuntu.com/ubuntu jammy main universe restricted multiverse\\ndeb http://security.ubuntu.com/ubuntu jammy-security main universe restricted multiverse\\n' > /etc/apt/sources.list; "
-            "apt-get update --allow-unauthenticated || true; "
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-unauthenticated ubuntu-keyring || true; "
-            "apt-get update --allow-unauthenticated || true; "
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated tmate curl wget sudo openssh-client ca-certificates"
-        )
-        code, out, err = await self._run(
-            self._bind_args(inst) + ['/bin/bash', '-c', cmd],
-            timeout=900
-        )
-        if code != 0:
-            logger.warning(f"Tmate install in {cid} failed: {err[-300:]}")
-        else:
-            logger.info(f"Tmate installed in {cid}")
+        logger.info(f"Tmate already present in {cid} (baked into rootfs)")
 
     async def exec_tmate(self, cid):
         try:
             return await asyncio.create_subprocess_exec(
                 *self._bind_args(self._instance_path(cid)),
-                '/bin/bash', '-c', 'tmate -F',
+                '/usr/bin/tmate', '-F',
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.STDOUT,
+                env={**os.environ, 'TERM': 'xterm', 'HOME': '/root'}
             )
         except Exception as e:
             logger.error(f"Tmate exec error for {cid}: {e}")
