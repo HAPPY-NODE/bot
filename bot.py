@@ -267,7 +267,7 @@ class ProotBackend:
             if os.path.isfile(ready_path):
                 try:
                     with open(ready_path) as f:
-                        ready = f.read().strip() == '3'
+                        ready = f.read().strip() == '4'
                 except Exception:
                     ready = False
             if ready:
@@ -281,7 +281,7 @@ class ProotBackend:
                 if ok:
                     await self._bake_static_tools(rootfs)
                     with open(ready_path, 'w') as f:
-                        f.write('3')
+                        f.write('4')
                     logger.info(f"Rootfs for {os_type} ready (static tools baked)")
                     return True
                 logger.warning(f"Rootfs method {m} failed for {os_type}")
@@ -296,29 +296,6 @@ class ProotBackend:
         except Exception as e:
             logger.error(f"Resolv copy failed: {e}")
         try:
-            tmp = os.path.join(BROOTFS_DIR, 'tmate-static.tar.xz')
-            work = os.path.join(BROOTFS_DIR, 'tmate-static-work')
-            if os.path.exists(work):
-                shutil.rmtree(work, ignore_errors=True)
-            await asyncio.to_thread(self._download, BTMATE_STATIC_URL, tmp)
-            await asyncio.to_thread(self._extract_tar_xz, tmp, work)
-            found = None
-            for root, dirs, files in os.walk(work):
-                for fn in files:
-                    if fn == 'tmate':
-                        found = os.path.join(root, fn)
-                        break
-                if found:
-                    break
-            if found:
-                shutil.copy2(found, os.path.join(rootfs, 'usr', 'bin', 'tmate'))
-                os.chmod(os.path.join(rootfs, 'usr', 'bin', 'tmate'), 0o755)
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            shutil.rmtree(work, ignore_errors=True)
-        except Exception as e:
-            logger.error(f"Tmate static bake failed: {e}")
-        try:
             btmp = os.path.join(BROOTFS_DIR, 'busybox.static')
             await asyncio.to_thread(self._download, BUSYBOX_STATIC_URL, btmp)
             shutil.copy2(btmp, os.path.join(rootfs, 'usr', 'local', 'bin', 'busybox'))
@@ -330,43 +307,6 @@ class ProotBackend:
             os.remove(btmp)
         except Exception as e:
             logger.error(f"Busybox static bake failed: {e}")
-        try:
-            curl = shutil.which('curl')
-            if not curl:
-                subprocess.run(['apt-get', 'install', '-y', 'curl'], capture_output=True)
-                curl = shutil.which('curl')
-            if curl:
-                inst_script = os.path.join(BROOTFS_DIR, 'sshx-install.sh')
-                await asyncio.to_thread(self._download, 'https://sshx.io/get', inst_script)
-                r = subprocess.run(['bash', inst_script], capture_output=True, text=True, timeout=300)
-                if r.returncode != 0:
-                    logger.warning(f"sshx install script failed: {r.stderr[-200:]}")
-                candidates = [
-                    os.path.expanduser('~/.local/bin/sshx'),
-                    '/root/.local/bin/sshx',
-                    '/usr/local/bin/sshx',
-                    '/usr/bin/sshx',
-                ]
-                found = None
-                for c in candidates:
-                    if os.path.isfile(c):
-                        found = c
-                        break
-                if found:
-                    shutil.copy2(found, os.path.join(rootfs, 'usr', 'local', 'bin', 'sshx'))
-                    os.chmod(os.path.join(rootfs, 'usr', 'local', 'bin', 'sshx'), 0o755)
-                    try:
-                        vr = subprocess.run([found, '-V'], capture_output=True, text=True, timeout=15)
-                        logger.info(f"sshx version: {(vr.stdout or vr.stderr).strip()[:120]}")
-                    except Exception:
-                        pass
-                    logger.info("sshx baked into rootfs")
-                else:
-                    logger.warning("sshx binary not found after install")
-                if os.path.exists(inst_script):
-                    os.remove(inst_script)
-        except Exception as e:
-            logger.error(f"sshx bake failed: {e}")
         try:
             ttmp = os.path.join(BROOTFS_DIR, 'ttyd.static')
             await asyncio.to_thread(self._download, BTTYD_URL, ttmp)
@@ -568,33 +508,7 @@ class ProotBackend:
         return True
 
     async def install_tmate(self, cid, os_type):
-        logger.info(f"Tmate already present in {cid} (baked into rootfs)")
-
-    async def exec_tmate(self, cid):
-        try:
-            return await asyncio.create_subprocess_exec(
-                *self._bind_args(self._instance_path(cid)),
-                '/usr/bin/tmate', '-F',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, 'TERM': 'xterm', 'HOME': '/root'}
-            )
-        except Exception as e:
-            logger.error(f"Tmate exec error for {cid}: {e}")
-            return None
-
-    async def exec_sshx(self, cid):
-        try:
-            return await asyncio.create_subprocess_exec(
-                *self._bind_args(self._instance_path(cid)),
-                '/usr/local/bin/sshx',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, 'TERM': 'xterm', 'HOME': '/root'}
-            )
-        except Exception as e:
-            logger.error(f"Sshx exec error for {cid}: {e}")
-            return None
+        logger.info(f"Tmate removed for {cid} (web terminal only)")
 
     def _instance_env(self):
         return {**os.environ, 'TERM': 'xterm', 'HOME': '/root'}
@@ -606,7 +520,6 @@ class ProotBackend:
         inst = self._instance_path(cid)
         import random as _r
         cred = f"happy{_r.randint(1000, 9999)}:node{_r.randint(10000, 99999)}"
-        proc_extra = {'stdout': asyncio.subprocess.PIPE, 'stderr': asyncio.subprocess.STDOUT, 'env': self._instance_env()}
         base = self._bind_args(inst)
         try:
             ttyd = await asyncio.create_subprocess_exec(
@@ -621,7 +534,9 @@ class ProotBackend:
         try:
             cf = await asyncio.create_subprocess_exec(
                 *base, '/usr/local/bin/cloudflared', 'tunnel', '--no-autoupdate',
-                '--url', 'http://localhost:7681', **proc_extra
+                '--url', 'http://localhost:7681',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                env=self._instance_env()
             )
         except Exception as e:
             logger.error(f"cloudflared start failed: {e}")
@@ -1037,59 +952,11 @@ async def capture_ssh_session_line(process):
         logger.warning("Tmate produced no output at all")
     return None
 
-async def docker_exec_tmate(container_id):
-    return await backend.exec_tmate(container_id)
-
-
-async def docker_exec_sshx(container_id):
-    return await backend.exec_sshx(container_id)
-
-
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 
 def clean_line(line):
     return ANSI_RE.sub('', line).strip()
-
-
-async def sshx_session(container_id):
-    proc = await docker_exec_sshx(container_id)
-    if not proc:
-        logger.warning("sshx exec failed")
-        return None
-    collected = []
-    try:
-        while True:
-            try:
-                line_b = await asyncio.wait_for(proc.stdout.readline(), timeout=50.0)
-            except asyncio.TimeoutError:
-                break
-            if not line_b:
-                break
-            line = clean_line(line_b.decode(errors='replace'))
-            if not line:
-                continue
-            collected.append(line)
-            low = line.lower()
-            m = re.search(r'https?://\S+', low)
-            if m:
-                return m.group(0)
-            if 'ssh:' in low or 'sshx.io' in low:
-                return line
-            if len(collected) > 15:
-                break
-    except Exception as e:
-        logger.error(f"sshx read error: {e}")
-    try:
-        proc.kill()
-    except Exception:
-        pass
-    text = ' | '.join(collected)
-    if text.strip():
-        logger.warning(f"sshx produced no session info: {text[:600]}")
-    else:
-        logger.warning("sshx produced no output")
-    return None
 
 
 async def proot_web_terminal_session(container_id):
@@ -1106,29 +973,13 @@ async def proot_web_terminal_session(container_id):
 
 
 async def get_ssh_line(container_id):
-    exec_process = await docker_exec_tmate(container_id)
-    if exec_process:
-        try:
-            ssh_line = await capture_ssh_session_line(exec_process)
-        finally:
-            try:
-                exec_process.kill()
-            except Exception:
-                pass
-        if ssh_line:
-            logger.info("SSH session obtained via tmate")
-            return ssh_line
-    logger.warning("tmate failed, falling back to sshx")
-    sshx_line = await sshx_session(container_id)
-    if sshx_line:
-        logger.info("SSH session obtained via sshx")
-        return sshx_line
-    logger.warning("sshx failed, falling back to ttyd web terminal")
     web_line = await proot_web_terminal_session(container_id)
     if web_line:
         logger.info("SSH session obtained via cloud web terminal")
         return web_line
+    logger.warning("web terminal failed")
     return None
+
 
 # Generic regen SSH
 async def regen_ssh_command(interaction: discord.Interaction, vps_identifier, send_response=True, target_user=None):
@@ -1171,51 +1022,6 @@ async def regen_ssh_command(interaction: discord.Interaction, vps_identifier, se
         if send_response:
             await interaction.followup.send(embed=embed, ephemeral=True)
         return False
-
-# Start/Stop/Restart helpers
-async def manage_vps(interaction: discord.Interaction, vps_identifier, action, target_user=None):
-    if target_user is None:
-        target_user = interaction.user
-    await interaction.response.defer(ephemeral=True)
-    vps = get_vps_by_identifier(target_user.id, vps_identifier)
-    if not vps:
-        embed = discord.Embed(description="No VPS found.", color=discord.Color.red())
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        return
-    if action == "start" and vps['suspended'] and target_user == interaction.user:
-        embed = discord.Embed(description="This VPS is suspended by an admin. Contact support.", color=discord.Color.red())
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        return
-    container_id = vps['container_id']
-    os_type = vps['os_type']
-    success = False
-    if action == "start":
-        success = await async_docker_start(container_id)
-        if success:
-            update_vps_status(container_id, "running")
-    elif action == "stop":
-        success = await async_docker_stop(container_id)
-        if success:
-            update_vps_status(container_id, "stopped")
-    elif action == "restart":
-        success = await async_docker_restart(container_id)
-        if success:
-            update_vps_status(container_id, "running")
-    if success:
-        os_name = "Ubuntu 22.04" if os_type == "ubuntu" else "Debian 12"
-        embed = discord.Embed(title=f"VPS {action.title()}ed Successfully", description=f"OS: {os_name}", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
-        embed.set_footer(text=WATERMARK, icon_url=bot.user.avatar.url if bot.user.avatar else None)
-        if action in ["start", "restart"]:
-            regen_success = await regen_ssh_command(interaction, vps_identifier, send_response=False, target_user=target_user)
-            if regen_success:
-                embed.description += "\nNew SSH session sent to DMs."
-            else:
-                embed.description += "\nFailed to generate new SSH session."
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    else:
-        embed = discord.Embed(description=f"Failed to {action} the VPS.", color=discord.Color.red())
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
 # Reinstall helper
 async def reinstall_vps(interaction: discord.Interaction, vps_identifier, os_type, target_user=None):
     if target_user is None:
