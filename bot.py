@@ -290,6 +290,10 @@ class ProotBackend:
         os.makedirs(os.path.join(rootfs, 'usr', 'bin'), exist_ok=True)
         os.makedirs(os.path.join(rootfs, 'usr', 'local', 'bin'), exist_ok=True)
         try:
+            shutil.copy('/etc/resolv.conf', os.path.join(rootfs, 'etc', 'resolv.conf'))
+        except Exception as e:
+            logger.error(f"Resolv copy failed: {e}")
+        try:
             tmp = os.path.join(BROOTFS_DIR, 'tmate-static.tar.xz')
             work = os.path.join(BROOTFS_DIR, 'tmate-static-work')
             if os.path.exists(work):
@@ -511,11 +515,11 @@ class ProotBackend:
     async def install_tmate(self, cid, os_type):
         logger.info(f"Tmate already present in {cid} (baked into rootfs)")
 
-    async def exec_tmate(self, cid):
+    async def exec_tmate(self, cid, port=22):
         try:
             return await asyncio.create_subprocess_exec(
                 *self._bind_args(self._instance_path(cid)),
-                '/usr/bin/tmate', '-F',
+                '/usr/bin/tmate', '-F', '-p', str(port),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env={**os.environ, 'TERM': 'xterm', 'HOME': '/root'}
@@ -898,8 +902,29 @@ async def capture_ssh_session_line(process):
         logger.warning("Tmate produced no output at all")
     return None
 
-async def docker_exec_tmate(container_id):
-    return await backend.exec_tmate(container_id)
+async def docker_exec_tmate(container_id, port=22):
+    return await backend.exec_tmate(container_id, port)
+
+
+async def get_ssh_line(container_id):
+    for port in (22, 443, 2222):
+        exec_process = await docker_exec_tmate(container_id, port)
+        if not exec_process:
+            await asyncio.sleep(3)
+            continue
+        try:
+            ssh_line = await capture_ssh_session_line(exec_process)
+        finally:
+            try:
+                exec_process.kill()
+            except Exception:
+                pass
+        if ssh_line:
+            logger.info(f"Tmate session obtained on port {port}")
+            return ssh_line
+        logger.warning(f"Tmate port {port} produced no session for {container_id}")
+        await asyncio.sleep(4)
+    return None
 
 # Generic regen SSH
 async def regen_ssh_command(interaction: discord.Interaction, vps_identifier, send_response=True, target_user=None):
@@ -919,39 +944,26 @@ async def regen_ssh_command(interaction: discord.Interaction, vps_identifier, se
     if send_response:
         await interaction.response.defer(ephemeral=True)
     container_id = vps['container_id']
-    exec_process = await docker_exec_tmate(container_id)
-    if exec_process:
+    ssh_line = await get_ssh_line(container_id)
+    if ssh_line:
+        update_vps_ssh(container_id, ssh_line)
+        embed = discord.Embed(title="New SSH Session Generated", description=f"```{ssh_line}```", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
+        embed.set_footer(text=WATERMARK, icon_url=bot.user.avatar.url if bot.user.avatar else None)
         try:
-            ssh_line = await capture_ssh_session_line(exec_process)
-        finally:
-            try:
-                exec_process.kill()
-            except Exception:
-                pass
-        if ssh_line:
-            update_vps_ssh(container_id, ssh_line)
-            embed = discord.Embed(title="New SSH Session Generated", description=f"```{ssh_line}```", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
-            embed.set_footer(text=WATERMARK, icon_url=bot.user.avatar.url if bot.user.avatar else None)
-            try:
-                await target_user.send(embed=embed)
-            except discord.Forbidden:
-                logger.warning(f"Cannot DM user {target_user.id}")
-                if send_response:
-                    embed_dm_fail = discord.Embed(description="New SSH session generated but could not send to DMs (privacy settings).", color=discord.Color.orange())
-                    await interaction.followup.send(embed=embed_dm_fail, ephemeral=True)
-                else:
-                    return True
+            await target_user.send(embed=embed)
+        except discord.Forbidden:
+            logger.warning(f"Cannot DM user {target_user.id}")
             if send_response:
-                embed_success = discord.Embed(description="New SSH session sent to your DMs.", color=discord.Color.green())
-                await interaction.followup.send(embed=embed_success, ephemeral=True)
-            return True
-        else:
-            embed = discord.Embed(description="Failed to generate SSH session.", color=discord.Color.red())
-            if send_response:
-                await interaction.followup.send(embed=embed, ephemeral=True)
-            return False
+                embed_dm_fail = discord.Embed(description="New SSH session generated but could not send to DMs (privacy settings).", color=discord.Color.orange())
+                await interaction.followup.send(embed=embed_dm_fail, ephemeral=True)
+            else:
+                return True
+        if send_response:
+            embed_success = discord.Embed(description="New SSH session sent to your DMs.", color=discord.Color.green())
+            await interaction.followup.send(embed=embed_success, ephemeral=True)
+        return True
     else:
-        embed = discord.Embed(description="Failed to execute tmate.", color=discord.Color.red())
+        embed = discord.Embed(description="Failed to generate SSH session.", color=discord.Color.red())
         if send_response:
             await interaction.followup.send(embed=embed, ephemeral=True)
         return False
@@ -1027,8 +1039,7 @@ async def reinstall_vps(interaction: discord.Interaction, vps_identifier, os_typ
     if new_container_id:
         await async_install_tmate(new_container_id, os_type)
         await asyncio.sleep(10)  # Wait longer for install
-        exec_process = await docker_exec_tmate(new_container_id)
-        ssh_line = await capture_ssh_session_line(exec_process)
+        ssh_line = await get_ssh_line(new_container_id)
         if ssh_line:
             add_vps(user_id, new_container_id, new_container_name, os_type, hostname, ssh_line, ram, cpu, disk)
             os_name = "Ubuntu 22.04" if os_type == "ubuntu" else "Debian 12"
@@ -1110,23 +1121,7 @@ async def create_vps(interaction: discord.Interaction, os_type, ram=DEFAULT_RAM,
     await asyncio.sleep(5)  # Wait for container to start
     await async_install_tmate(container_id, os_type)
     await asyncio.sleep(10)  # Wait for install
-    ssh_line = None
-    for attempt in range(3):
-        exec_process = await docker_exec_tmate(container_id)
-        if not exec_process:
-            await asyncio.sleep(8)
-            continue
-        try:
-            ssh_line = await capture_ssh_session_line(exec_process)
-        finally:
-            try:
-                exec_process.kill()
-            except Exception:
-                pass
-        if ssh_line:
-            break
-        logger.warning(f"Tmate attempt {attempt + 1}/3 produced no session for {container_id}")
-        await asyncio.sleep(10)
+    ssh_line = await get_ssh_line(container_id)
     if ssh_line:
         add_vps(user_id, container_id, container_name, os_type, hostname, ssh_line, ram, cpu, disk)
         os_name = "Ubuntu 22.04" if os_type == "ubuntu" else "Debian 12"
