@@ -271,6 +271,7 @@ class ProotBackend:
                 except Exception:
                     ready = False
             if ready:
+                await self._ensure_ca_certs(rootfs)
                 return True
             if os.path.isdir(rootfs):
                 subprocess.run(['rm', '-rf', rootfs])
@@ -289,8 +290,6 @@ class ProotBackend:
             return False
 
     async def _bake_static_tools(self, rootfs):
-        os.makedirs(os.path.join(rootfs, 'usr', 'bin'), exist_ok=True)
-        os.makedirs(os.path.join(rootfs, 'usr', 'local', 'bin'), exist_ok=True)
         try:
             shutil.copy('/etc/resolv.conf', os.path.join(rootfs, 'etc', 'resolv.conf'))
         except Exception as e:
@@ -323,6 +322,18 @@ class ProotBackend:
             os.remove(ctmp)
         except Exception as e:
             logger.error(f"cloudflared bake failed: {e}")
+    def _ensure_ca_certs(self, rootfs):
+        try:
+            certdir = os.path.join(rootfs, 'etc', 'ssl', 'certs')
+            os.makedirs(certdir, exist_ok=True)
+            src = '/etc/ssl/certs/ca-certificates.crt'
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(certdir, 'ca-certificates.crt'))
+            else:
+                subprocess.run(['update-ca-certificates'], capture_output=True, timeout=60)
+            logger.info("CA certificates baked into rootfs")
+        except Exception as e:
+            logger.error(f"CA cert bake failed: {e}")
 
     @staticmethod
     def _extract_tar_xz(src, dst):
@@ -519,11 +530,12 @@ class ProotBackend:
     async def exec_web_terminal(self, cid):
         inst = self._instance_path(cid)
         import random as _r
-        cred = f"happy{_r.randint(1000, 9999)}:node{_r.randint(10000, 99999)}"
+        cred_u = f"happy{_r.randint(1000, 9999)}"
+        cred_p = f"node{_r.randint(10000, 99999)}"
         base = self._bind_args(inst)
         try:
             ttyd = await asyncio.create_subprocess_exec(
-                *base, '/usr/local/bin/ttyd', '-p', '7681', '-c', cred, '/bin/bash',
+                *base, '/usr/local/bin/ttyd', '-p', '7681', '-c', f"{cred_u}:{cred_p}", '/bin/bash',
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 env=self._instance_env()
             )
@@ -546,20 +558,22 @@ class ProotBackend:
             except Exception:
                 pass
             return None
+        TUNNEL_SKIP_HOSTS = {'api', 'www', 'dash', 'developers', 'support', 'community', 'cloudflare'}
         try:
-            for _ in range(40):
+            for _ in range(60):
                 try:
-                    line_b = await asyncio.wait_for(cf.stdout.readline(), timeout=3)
+                    line_b = await asyncio.wait_for(cf.stdout.readline(), timeout=2.5)
                 except asyncio.TimeoutError:
                     continue
                 if not line_b:
                     raise RuntimeError('cloudflared exited early')
                 line = ANSI_RE.sub('', line_b.decode(errors='replace')).strip()
                 logger.info(f"cloudflared: {line[:160]}")
-                if 'trycloudflare.com' in line:
-                    m = re.search(r'https?://\S*trycloudflare\.com', line)
-                    if m:
-                        return f"{m.group(0)} | login: {cred}"
+                low = line.lower()
+                if 'trycloudflare.com' in low:
+                    m = re.search(r'https://([a-z0-9-]+)\.trycloudflare\.com', low)
+                    if m and m.group(1) not in TUNNEL_SKIP_HOSTS:
+                        return f"URL: {m.group(0)}\nLogin: {cred_u}\nPassword: {cred_p}"
             raise RuntimeError('cloudflared produced no tunnel URL')
         except Exception as e:
             logger.error(f"Web terminal failed: {e}")
