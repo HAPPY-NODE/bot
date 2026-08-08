@@ -265,7 +265,7 @@ class ProotBackend:
             if os.path.isfile(ready_path):
                 try:
                     with open(ready_path) as f:
-                        ready = f.read().strip() == '1'
+                        ready = f.read().strip() == '2'
                 except Exception:
                     ready = False
             if ready:
@@ -279,7 +279,7 @@ class ProotBackend:
                 if ok:
                     await self._bake_static_tools(rootfs)
                     with open(ready_path, 'w') as f:
-                        f.write('1')
+                        f.write('2')
                     logger.info(f"Rootfs for {os_type} ready (tmate preinstalled)")
                     return True
                 logger.warning(f"Rootfs method {m} failed for {os_type}")
@@ -328,6 +328,38 @@ class ProotBackend:
             os.remove(btmp)
         except Exception as e:
             logger.error(f"Busybox static bake failed: {e}")
+        try:
+            curl = shutil.which('curl')
+            if not curl:
+                subprocess.run(['apt-get', 'install', '-y', 'curl'], capture_output=True)
+                curl = shutil.which('curl')
+            if curl:
+                inst_script = os.path.join(BROOTFS_DIR, 'sshx-install.sh')
+                await asyncio.to_thread(self._download, 'https://sshx.io/get', inst_script)
+                r = subprocess.run(['bash', inst_script], capture_output=True, text=True, timeout=300)
+                if r.returncode != 0:
+                    logger.warning(f"sshx install script failed: {r.stderr[-200:]}")
+                candidates = [
+                    os.path.expanduser('~/.local/bin/sshx'),
+                    '/root/.local/bin/sshx',
+                    '/usr/local/bin/sshx',
+                    '/usr/bin/sshx',
+                ]
+                found = None
+                for c in candidates:
+                    if os.path.isfile(c):
+                        found = c
+                        break
+                if found:
+                    shutil.copy2(found, os.path.join(rootfs, 'usr', 'local', 'bin', 'sshx'))
+                    os.chmod(os.path.join(rootfs, 'usr', 'local', 'bin', 'sshx'), 0o755)
+                    logger.info("sshx baked into rootfs")
+                else:
+                    logger.warning("sshx binary not found after install")
+                if os.path.exists(inst_script):
+                    os.remove(inst_script)
+        except Exception as e:
+            logger.error(f"sshx bake failed: {e}")
 
     @staticmethod
     def _extract_tar_xz(src, dst):
@@ -515,17 +547,30 @@ class ProotBackend:
     async def install_tmate(self, cid, os_type):
         logger.info(f"Tmate already present in {cid} (baked into rootfs)")
 
-    async def exec_tmate(self, cid, port=22):
+    async def exec_tmate(self, cid):
         try:
             return await asyncio.create_subprocess_exec(
                 *self._bind_args(self._instance_path(cid)),
-                '/usr/bin/tmate', '-F', '-p', str(port),
+                '/usr/bin/tmate', '-F',
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env={**os.environ, 'TERM': 'xterm', 'HOME': '/root'}
             )
         except Exception as e:
             logger.error(f"Tmate exec error for {cid}: {e}")
+            return None
+
+    async def exec_sshx(self, cid):
+        try:
+            return await asyncio.create_subprocess_exec(
+                *self._bind_args(self._instance_path(cid)),
+                '/usr/local/bin/sshx', 'run',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env={**os.environ, 'TERM': 'xterm', 'HOME': '/root'}
+            )
+        except Exception as e:
+            logger.error(f"Sshx exec error for {cid}: {e}")
             return None
 
     def _load_meta(self, cid):
@@ -902,16 +947,45 @@ async def capture_ssh_session_line(process):
         logger.warning("Tmate produced no output at all")
     return None
 
-async def docker_exec_tmate(container_id, port=22):
-    return await backend.exec_tmate(container_id, port)
+async def docker_exec_tmate(container_id):
+    return await backend.exec_tmate(container_id)
+
+
+async def docker_exec_sshx(container_id):
+    return await backend.exec_sshx(container_id)
+
+
+async def sshx_session(container_id):
+    proc = await docker_exec_sshx(container_id)
+    if not proc:
+        logger.warning("sshx exec failed for create")
+        return None
+    try:
+        out = await asyncio.wait_for(proc.communicate(), timeout=150)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        out = await proc.communicate()
+    text = '\n'.join(b.decode(errors='replace') for b in out if b)
+    for line in text.splitlines():
+        low = line.lower()
+        if 'ssh' in low and ('@' in line or 'sshx.io' in low or 'http' in low):
+            return line.strip()
+    for line in text.splitlines():
+        if 'https://' in line:
+            return line.strip()
+    if text.strip():
+        logger.warning(f"sshx produced no session info:\n{text.strip()[:600]}")
+    else:
+        logger.warning("sshx produced no output")
+    return None
 
 
 async def get_ssh_line(container_id):
-    for port in (22, 443, 2222):
-        exec_process = await docker_exec_tmate(container_id, port)
-        if not exec_process:
-            await asyncio.sleep(3)
-            continue
+    exec_process = await docker_exec_tmate(container_id)
+    if exec_process:
         try:
             ssh_line = await capture_ssh_session_line(exec_process)
         finally:
@@ -920,10 +994,13 @@ async def get_ssh_line(container_id):
             except Exception:
                 pass
         if ssh_line:
-            logger.info(f"Tmate session obtained on port {port}")
+            logger.info("SSH session obtained via tmate")
             return ssh_line
-        logger.warning(f"Tmate port {port} produced no session for {container_id}")
-        await asyncio.sleep(4)
+    logger.warning("tmate failed, falling back to sshx")
+    sshx_line = await sshx_session(container_id)
+    if sshx_line:
+        logger.info("SSH session obtained via sshx")
+        return sshx_line
     return None
 
 # Generic regen SSH
