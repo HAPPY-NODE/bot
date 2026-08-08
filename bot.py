@@ -20,6 +20,7 @@ import signal
 import tarfile
 import urllib.request
 import uuid
+import socket
 
 logger = logging.getLogger('vps_backend')
 
@@ -48,7 +49,7 @@ BTMATE_STATIC_URL = 'https://github.com/tmate-io/tmate/releases/download/2.4.0/t
 BUSYBOX_STATIC_URL = 'https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox'
 BTTYD_URL = 'https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64'
 BCLOUDFLARED_URL = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64'
-BNEOFETCH_URL = 'https://raw.githubusercontent.com/neofetch/neofetch/master/neofetch'
+BNEOFETCH_URL = 'https://raw.githubusercontent.com/dylanaraps/neofetch/master/neofetch'
 
 bsetup_lock = asyncio.Lock()
 
@@ -641,62 +642,90 @@ power management:
         cred_p = "node"
         port = 7681 + _r.randint(0, 999)
         base = self._bind_args(inst)
-        try:
-            ttyd = await asyncio.create_subprocess_exec(
-                *base, '/usr/local/bin/ttyd', '-w', '-p', str(port), '-c', f"{cred_u}:{cred_p}", '/bin/bash',
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                env=self._instance_env()
-            )
-        except Exception as e:
-            logger.error(f"ttyd start failed: {e}")
-            return None
-        await asyncio.sleep(2)
-        try:
-            cf = await asyncio.create_subprocess_exec(
-                *base, '/usr/local/bin/cloudflared', 'tunnel', '--no-autoupdate',
-                '--url', f'http://localhost:{port}',
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                env=self._instance_env()
-            )
-        except Exception as e:
-            logger.error(f"cloudflared start failed: {e}")
+        sleep_before = 1.2
+        for attempt in range(3):
+            port = 7681 + _r.randint(0, 999)
+            ttyd = None
+            cf = None
+            ttyd_lines = []
             try:
-                ttyd.kill()
-                await ttyd.wait()
-            except Exception:
-                pass
-            return None
-        TUNNEL_SKIP_HOSTS = {'api', 'www', 'dash', 'developers', 'support', 'community', 'cloudflare'}
-        try:
-            for _ in range(60):
+                ttyd = await asyncio.create_subprocess_exec(
+                    *base, '/usr/local/bin/ttyd', '-w', '-p', str(port), '-c', f"{cred_u}:{cred_p}", '/bin/bash',
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    env=self._instance_env()
+                )
+            except Exception as e:
+                logger.error(f"ttyd start failed: {e}")
+                return None
+            await asyncio.sleep(sleep_before)
+            alive = ttyd.returncode is None
+            if alive:
                 try:
-                    line_b = await asyncio.wait_for(cf.stdout.readline(), timeout=2.5)
-                except asyncio.TimeoutError:
-                    continue
-                if not line_b:
-                    raise RuntimeError('cloudflared exited early')
-                line = ANSI_RE.sub('', line_b.decode(errors='replace')).strip()
-                logger.info(f"cloudflared: {line[:160]}")
-                low = line.lower()
-                if 'trycloudflare.com' in low:
-                    m = re.search(r'https://([a-z0-9-]+)\.trycloudflare\.com', low)
-                    if m and m.group(1) not in TUNNEL_SKIP_HOSTS:
-                        return f"URL: {m.group(0)}\nLogin: {cred_u}\nPassword: {cred_p}"
-            raise RuntimeError('cloudflared produced no tunnel URL')
-        except Exception as e:
-            logger.error(f"Web terminal failed: {e}")
-            for p in (cf, ttyd):
+                    s = socket.create_connection(('127.0.0.1', port), timeout=2)
+                    s.close()
+                    alive = True
+                except Exception:
+                    alive = False
+            if not alive:
                 try:
-                    p.kill()
+                    line_b = await asyncio.wait_for(ttyd.stdout.readline(), timeout=1)
+                    ttyd_lines.append(line_b.decode(errors='replace').strip()[:200])
                 except Exception:
                     pass
-            await asyncio.sleep(1)
-            for p in (cf, ttyd):
                 try:
-                    p.kill()
+                    ttyd.kill()
                 except Exception:
                     pass
-            return None
+                logger.error(f"ttyd not listening on {port}. Lines: {' | '.join(ttyd_lines[:6])}")
+                continue
+            logger.info(f"ttyd up on port {port}")
+            try:
+                cf = await asyncio.create_subprocess_exec(
+                    *base, '/usr/local/bin/cloudflared', 'tunnel', '--no-autoupdate',
+                    '--url', f'http://localhost:{port}',
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    env=self._instance_env()
+                )
+            except Exception as e:
+                logger.error(f"cloudflared start failed: {e}")
+                try:
+                    ttyd.kill()
+                    await ttyd.wait()
+                except Exception:
+                    pass
+                return None
+            TUNNEL_SKIP_HOSTS = {'api', 'www', 'dash', 'developers', 'support', 'community', 'cloudflare'}
+            try:
+                for _ in range(60):
+                    try:
+                        line_b = await asyncio.wait_for(cf.stdout.readline(), timeout=2.5)
+                    except asyncio.TimeoutError:
+                        continue
+                    if not line_b:
+                        raise RuntimeError('cloudflared exited early')
+                    line = ANSI_RE.sub('', line_b.decode(errors='replace')).strip()
+                    logger.info(f"cloudflared: {line[:160]}")
+                    low = line.lower()
+                    if 'trycloudflare.com' in low:
+                        m = re.search(r'https://([a-z0-9-]+)\.trycloudflare\.com', low)
+                        if m and m.group(1) not in TUNNEL_SKIP_HOSTS:
+                            return f"URL: {m.group(0)}\nLogin: {cred_u}\nPassword: {cred_p}"
+                raise RuntimeError('cloudflared produced no tunnel URL')
+            except Exception as e:
+                logger.error(f"Web terminal failed (attempt {attempt + 1}): {e}")
+                for p in (cf, ttyd):
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                await asyncio.sleep(1)
+                for p in (cf, ttyd):
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+        logger.error("Web terminal failed after 3 attempts")
+        return None
 
     def _load_meta(self, cid):
         try:
