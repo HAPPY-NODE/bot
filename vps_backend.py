@@ -401,15 +401,57 @@ def _probe_docker():
         r = subprocess.run(['unshare', '--mount', 'true'], capture_output=True, timeout=10)
         if r.returncode != 0:
             return False
-        r = subprocess.run(['docker', 'info'], capture_output=True, timeout=15)
+    except Exception:
+        return False
+    if not _docker_alive():
+        _start_dockerd()
+    if not _docker_alive():
+        return False
+    return _run_docker(['hello-world']) == 0
+
+
+def _docker_alive():
+    try:
+        r = subprocess.run(['docker', 'info'], capture_output=True, timeout=20)
         return r.returncode == 0
     except Exception:
         return False
 
 
+def _start_dockerd():
+    try:
+        log = open('/var/log/dockerd.log', 'ab')
+        subprocess.Popen(
+            ['dockerd'],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True
+        )
+        for _ in range(20):
+            time.sleep(1)
+            if _docker_alive():
+                return True
+    except Exception:
+        pass
+    return _docker_alive()
+
+
+def _run_docker(args):
+    try:
+        return subprocess.run(
+            ['docker', 'run', '--rm'] + args,
+            capture_output=True,
+            timeout=60
+        ).returncode
+    except Exception:
+        return -1
+
+
 def get_backend():
     if os.environ.get('VPS_BACKEND', 'auto').lower() == 'docker':
         return DockerBackend()
+    if os.environ.get('VPS_BACKEND', 'auto').lower() == 'proot':
+        return ProotBackend()
     if _probe_docker():
         return DockerBackend()
     return ProotBackend()

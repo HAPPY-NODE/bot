@@ -234,6 +234,15 @@ def get_logs(container_id, lines=50):
 
 # Async VPS helpers
 async def async_docker_run(image, hostname, ram, cpu, disk, container_name):
+    global backend
+    if backend.name != 'proot':
+        cid = await backend.run(image, hostname, ram, cpu, disk, container_name)
+        if cid is None:
+            logger.warning("Docker VPS creation failed - switching to Proot backend")
+            from vps_backend import ProotBackend
+            backend = ProotBackend()
+            return await backend.run(image, hostname, ram, cpu, disk, container_name)
+        return cid
     return await backend.run(image, hostname, ram, cpu, disk, container_name)
 
 async def async_docker_start(container_id):
