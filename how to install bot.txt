@@ -1,0 +1,55 @@
+git clone https://github.com/hopingboyz/vps-deploy
+
+cd vps-deploy
+
+cp test.env .env
+
+apt install python3-pip -y
+
+mkdir -p ~/.config/pip && echo -e "[global]\nbreak-system-packages = true" > ~/.config/pip/pip.conf
+
+pip install -r requirements.txt
+
+sudo nano /etc/systemd/system/unixbot.service
+
+[Unit]
+Description=UnixBot Discord Bot
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 /root/bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+
+sudo systemctl daemon-reload
+sudo systemctl restart unixbot
+
+# ============================================
+# Option B: Running inside Podman/ttyd container (NO systemd)
+# The bot auto-detects: uses Docker if it works, otherwise Proot mode
+# (Proot works even where nested Docker containers are blocked)
+# ============================================
+
+apt-get update -y && apt-get install -y python3 python3-venv python3-pip proot debootstrap \
+  && cd /root/vps-bot \
+  && python3 -m venv venv \
+  && ./venv/bin/pip install --upgrade pip \
+  && ./venv/bin/pip install -r requirements.txt \
+  && ./venv/bin/python -c "from vps_backend import get_backend; b=get_backend(); print('Backend:', b.name)" \
+  && nohup ./venv/bin/python bot.py > bot.log 2>&1 &
+sleep 5 && tail -20 bot.log
+
+# Force Docker mode (if you are sure Docker works here):
+#   VPS_BACKEND=docker ./venv/bin/python bot.py
+# Force Proot mode:
+#   VPS_BACKEND=proot ./venv/bin/python bot.py
+
+# Check backend + Docker blocking:
+#   systemd-detect-virt        (podman = you are in a container)
+#   unshare --mount true       (fails = Docker containers will fail too)
