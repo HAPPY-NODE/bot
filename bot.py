@@ -353,6 +353,11 @@ class ProotBackend:
                 if found:
                     shutil.copy2(found, os.path.join(rootfs, 'usr', 'local', 'bin', 'sshx'))
                     os.chmod(os.path.join(rootfs, 'usr', 'local', 'bin', 'sshx'), 0o755)
+                    try:
+                        vr = subprocess.run([found, '-V'], capture_output=True, text=True, timeout=15)
+                        logger.info(f"sshx version: {(vr.stdout or vr.stderr).strip()[:120]}")
+                    except Exception:
+                        pass
                     logger.info("sshx baked into rootfs")
                 else:
                     logger.warning("sshx binary not found after install")
@@ -958,26 +963,33 @@ async def docker_exec_sshx(container_id):
 async def sshx_session(container_id):
     proc = await docker_exec_sshx(container_id)
     if not proc:
-        logger.warning("sshx exec failed for create")
+        logger.warning("sshx exec failed")
         return None
+    collected = []
     try:
-        out = await asyncio.wait_for(proc.communicate(), timeout=150)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        out = await proc.communicate()
-    text = '\n'.join(b.decode(errors='replace') for b in out if b)
-    for line in text.splitlines():
-        low = line.lower()
-        if 'ssh' in low and ('@' in line or 'sshx.io' in low or 'http' in low):
-            return line.strip()
-    for line in text.splitlines():
-        if 'https://' in line:
-            return line.strip()
+        while True:
+            try:
+                line_b = await asyncio.wait_for(proc.stdout.readline(), timeout=50.0)
+            except asyncio.TimeoutError:
+                break
+            if not line_b:
+                break
+            line = line_b.decode(errors='replace').strip()
+            collected.append(line)
+            low = line.lower()
+            if 'http' in low or 'ssh:' in low or 'sshx.io' in low:
+                return line
+            if len(collected) > 15:
+                break
+    except Exception as e:
+        logger.error(f"sshx read error: {e}")
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    text = ' | '.join(collected)
     if text.strip():
-        logger.warning(f"sshx produced no session info:\n{text.strip()[:600]}")
+        logger.warning(f"sshx produced no session info: {text[:600]}")
     else:
         logger.warning("sshx produced no output")
     return None
