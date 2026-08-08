@@ -459,10 +459,17 @@ class ProotBackend:
 
     async def install_tmate(self, cid, os_type):
         inst = self._instance_path(cid)
+        cmd = (
+            "rm -f /etc/apt/sources.list.d/ubuntu.sources; "
+            "printf 'deb http://archive.ubuntu.com/ubuntu jammy main universe restricted multiverse\\ndeb http://security.ubuntu.com/ubuntu jammy-security main universe restricted multiverse\\n' > /etc/apt/sources.list; "
+            "apt-get update || true; "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ubuntu-keyring || true; "
+            "apt-get update || true; "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y tmate curl wget sudo openssh-client"
+        )
         code, out, err = await self._run(
-            self._bind_args(inst) + ['/bin/bash', '-c',
-             'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tmate curl wget sudo openssh-client'],
-            timeout=600
+            self._bind_args(inst) + ['/bin/bash', '-c', cmd],
+            timeout=900
         )
         if code != 0:
             logger.warning(f"Tmate install in {cid} failed: {err[-300:]}")
