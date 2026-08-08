@@ -462,10 +462,10 @@ class ProotBackend:
         cmd = (
             "rm -f /etc/apt/sources.list.d/ubuntu.sources; "
             "printf 'deb http://archive.ubuntu.com/ubuntu jammy main universe restricted multiverse\\ndeb http://security.ubuntu.com/ubuntu jammy-security main universe restricted multiverse\\n' > /etc/apt/sources.list; "
-            "apt-get update || true; "
+            "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true || true; "
             "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ubuntu-keyring || true; "
-            "apt-get update || true; "
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y tmate curl wget sudo openssh-client"
+            "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true || true; "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true tmate curl wget sudo openssh-client ca-certificates"
         )
         code, out, err = await self._run(
             self._bind_args(inst) + ['/bin/bash', '-c', cmd],
