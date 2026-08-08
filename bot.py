@@ -271,7 +271,7 @@ class ProotBackend:
                 except Exception:
                     ready = False
             if ready:
-                await self._ensure_ca_certs(rootfs)
+                self._ensure_ca_certs(rootfs)
                 return True
             if os.path.isdir(rootfs):
                 subprocess.run(['rm', '-rf', rootfs])
