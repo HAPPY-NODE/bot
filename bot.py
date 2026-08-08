@@ -660,10 +660,11 @@ power management:
             ttyd_lines = []
             rb = os.path.join(self._instance_path(cid), 'usr', 'local', 'bin', 'ttyd')
             cmd = None
+            ttyd_flags = ['--writable', '--port', str(port), '--credential', f"{cred_u}:{cred_p}"]
             if os.path.isfile(rb):
-                cmd = [*base, rb, '-w', '-i', '0.0.0.0', '-p', str(port), '-c', f"{cred_u}:{cred_p}", '/bin/bash']
+                cmd = [*base, rb, *ttyd_flags, '/bin/bash']
             elif os.path.isfile(host_ttyd):
-                cmd = [host_ttyd, '-w', '-i', '0.0.0.0', '-p', str(port), '-c', f"{cred_u}:{cred_p}", *base, '/bin/bash']
+                cmd = [host_ttyd, *ttyd_flags, *base, '/bin/bash']
             if not cmd:
                 logger.error("ttyd binary not found in rootfs or host")
                 return None
