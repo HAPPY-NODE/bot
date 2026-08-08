@@ -18,6 +18,7 @@ import json
 import shutil
 import signal
 import tarfile
+import urllib.request
 import uuid
 
 logger = logging.getLogger('vps_backend')
@@ -35,6 +36,13 @@ BIMAGES = {
     'ubuntu': 'ubuntu:22.04',
     'debian': 'debian:bookworm',
 }
+
+BUBUNTU_BASE_URLS = [
+    'http://cdimage.ubuntu.com/ubuntu-base/releases/jammy/release/ubuntu-base-22.04.4-base-amd64.tar.gz',
+    'http://cdimage.ubuntu.com/ubuntu-base/releases/jammy/release/ubuntu-base-22.04.3-base-amd64.tar.gz',
+    'http://cdimage.ubuntu.com/ubuntu-base/releases/jammy/release/ubuntu-base-22.04.2-base-amd64.tar.gz',
+    'http://cdimage.ubuntu.com/ubuntu-base/releases/jammy/release/ubuntu-base-22.04.1-base-amd64.tar.gz',
+]
 
 bsetup_lock = asyncio.Lock()
 
@@ -254,6 +262,10 @@ class ProotBackend:
             if os.path.isdir(rootfs):
                 subprocess.run(['rm', '-rf', rootfs])
             os.makedirs(BROOTFS_DIR, exist_ok=True)
+            if await self._rootfs_from_tarball(os_type, rootfs):
+                with open(os.path.join(rootfs, '.ready'), 'w') as f:
+                    f.write('ok')
+                return True
             if await self._rootfs_from_docker(os_type, rootfs):
                 with open(os.path.join(rootfs, '.ready'), 'w') as f:
                     f.write('ok')
@@ -266,6 +278,40 @@ class ProotBackend:
                 return True
             subprocess.run(['rm', '-rf', rootfs])
             return False
+
+    async def _rootfs_from_tarball(self, os_type, rootfs):
+        try:
+            tmp = os.path.join(BROOTFS_DIR, 'download.tmp')
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            for url in BUBUNTU_BASE_URLS:
+                try:
+                    await asyncio.to_thread(self._download, url, tmp)
+                    await asyncio.to_thread(self._extract_tar_gz, tmp, rootfs)
+                    os.remove(tmp)
+                    logger.info(f"Rootfs for {os_type} extracted from {url}")
+                    return True
+                except Exception as e:
+                    logger.warning(f"Tarball {url} failed: {e}")
+                    continue
+        except Exception as e:
+            logger.error(f"Tarball download error: {e}")
+        return False
+
+    @staticmethod
+    def _download(url, dest):
+        req = urllib.request.Request(url, headers={'User-Agent': 'vps-bot/1.0'})
+        with urllib.request.urlopen(req, timeout=60) as resp, open(dest, 'wb') as f:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    return
+                f.write(chunk)
+
+    @staticmethod
+    def _extract_tar_gz(src, dst):
+        with tarfile.open(src, 'r:gz') as tar:
+            tar.extractall(path=dst)
 
     async def _rootfs_from_docker(self, os_type, rootfs):
         image = BIMAGES[os_type]
