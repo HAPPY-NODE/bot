@@ -879,16 +879,23 @@ async def async_install_tmate(container_id, os_type):
 
 # SSH capture
 async def capture_ssh_session_line(process):
+    collected = []
     while True:
         try:
             output = await asyncio.wait_for(process.stdout.readline(), timeout=30.0)
             if not output:
                 break
-            output = output.decode('utf-8').strip()
-            if "ssh session:" in output.lower():
-                return output.split("ssh session:")[-1].strip()
+            line = output.decode('utf-8', errors='replace').strip()
+            collected.append(line)
+            logger.debug(f"Tmate line: {line}")
+            if "ssh session:" in line.lower():
+                return line.split("ssh session:")[-1].strip()
         except asyncio.TimeoutError:
             break
+    if collected:
+        logger.warning(f"Tmate produced no session line. Lines: {' | '.join(collected[-6:])}")
+    else:
+        logger.warning("Tmate produced no output at all")
     return None
 
 async def docker_exec_tmate(container_id):
@@ -914,7 +921,13 @@ async def regen_ssh_command(interaction: discord.Interaction, vps_identifier, se
     container_id = vps['container_id']
     exec_process = await docker_exec_tmate(container_id)
     if exec_process:
-        ssh_line = await capture_ssh_session_line(exec_process)
+        try:
+            ssh_line = await capture_ssh_session_line(exec_process)
+        finally:
+            try:
+                exec_process.kill()
+            except Exception:
+                pass
         if ssh_line:
             update_vps_ssh(container_id, ssh_line)
             embed = discord.Embed(title="New SSH Session Generated", description=f"```{ssh_line}```", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
@@ -1097,8 +1110,23 @@ async def create_vps(interaction: discord.Interaction, os_type, ram=DEFAULT_RAM,
     await asyncio.sleep(5)  # Wait for container to start
     await async_install_tmate(container_id, os_type)
     await asyncio.sleep(10)  # Wait for install
-    exec_process = await docker_exec_tmate(container_id)
-    ssh_line = await capture_ssh_session_line(exec_process)
+    ssh_line = None
+    for attempt in range(3):
+        exec_process = await docker_exec_tmate(container_id)
+        if not exec_process:
+            await asyncio.sleep(8)
+            continue
+        try:
+            ssh_line = await capture_ssh_session_line(exec_process)
+        finally:
+            try:
+                exec_process.kill()
+            except Exception:
+                pass
+        if ssh_line:
+            break
+        logger.warning(f"Tmate attempt {attempt + 1}/3 produced no session for {container_id}")
+        await asyncio.sleep(10)
     if ssh_line:
         add_vps(user_id, container_id, container_name, os_type, hostname, ssh_line, ram, cpu, disk)
         os_name = "Ubuntu 22.04" if os_type == "ubuntu" else "Debian 12"
